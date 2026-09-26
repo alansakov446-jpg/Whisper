@@ -1,0 +1,58 @@
+name: Whisper bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    # UTC. A new run starts every 5 hours and replaces the previous one,
+    # so the process never hits the 360-minute GitHub job limit.
+    - cron: "0 */5 * * *"
+
+concurrency:
+  group: whisper-bot
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Check required secrets
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          FERNET_KEY: ${{ secrets.FERNET_KEY }}
+        run: |
+          missing=0
+          if [ -z "$BOT_TOKEN" ]; then echo "::error::Add repository secret BOT_TOKEN"; missing=1; fi
+          if [ -z "$DATABASE_URL" ]; then echo "::error::Add repository secret DATABASE_URL (Neon Postgres)"; missing=1; fi
+          if [ -z "$FERNET_KEY" ]; then echo "::error::Add repository secret FERNET_KEY"; missing=1; fi
+          exit "$missing"
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install pg_dump
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Install Python dependencies
+        run: python -m pip install --upgrade pip && pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          FERNET_KEY: ${{ secrets.FERNET_KEY }}
+          BACKUP_REPO_URL: ${{ secrets.BACKUP_REPO_URL }}
+          HEARTBEAT_URL: ${{ secrets.HEARTBEAT_URL }}
+          HEALTH_HOST: 0.0.0.0
+          HEALTH_PORT: "8080"
+          BACKUP_INTERVAL_MINUTES: "30"
+          LOG_LEVEL: INFO
+        run: python -m bot

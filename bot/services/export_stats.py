@@ -105,3 +105,43 @@ async def count_readable_sent(session: AsyncSession, user_id: int) -> int:
         .where(or_(Whisper.sender_id == user_id, Whisper.recipient_id == user_id))
     )
     return int(value or 0)
+
+
+async def export_group(session: AsyncSession, group, now: datetime | None = None) -> dict:
+    """Group JSON export for its creator: meta, members, whispers."""
+    from bot.db import repo
+    from bot.utils.time import iso
+
+    now = now or utcnow()
+    members = await repo.list_members(session, group.id)
+    whispers = await repo.list_group_whispers(session, group.id, limit=200)
+    return {
+        "exported_at": iso(now),
+        "group": {
+            "id": group.id,
+            "name": group.name,
+            "creator_id": group.creator_id,
+            "successor_id": group.successor_id,
+            "auto_join": bool(group.auto_join),
+            "created_at": iso(group.created_at),
+        },
+        "members": [
+            {
+                "user_id": member.user_id,
+                "username": member.username,
+                "joined_at": iso(member.joined_at),
+            }
+            for member in members
+        ],
+        "whispers": [
+            {
+                "token": whisper.token,
+                "text": whisper.text if whisper.status != "destroyed" else None,
+                "media_type": whisper.media_type if whisper.status != "destroyed" else None,
+                "status": whisper.status,
+                "created_at": iso(whisper.created_at),
+                "expires_at": iso(whisper.expires_at),
+            }
+            for whisper in whispers
+        ],
+    }

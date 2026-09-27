@@ -12,6 +12,10 @@ class Cipher:
         self.fernet = Fernet(raw)
         self._key = raw
 
+    @property
+    def secret_key(self) -> str:
+        return self._key.decode() if isinstance(self._key, bytes) else str(self._key)
+
     def encrypt_sender(self, user_id: int) -> str:
         return self.fernet.encrypt(str(int(user_id)).encode()).decode()
 
@@ -20,6 +24,15 @@ class Cipher:
             return int(self.fernet.decrypt(token.encode()).decode())
         except (InvalidToken, ValueError) as exc:
             raise ValueError("cannot decrypt sender id") from exc
+
+    def encrypt_secret(self, plain: str) -> str:
+        return self.fernet.encrypt(plain.encode("utf-8")).decode()
+
+    def decrypt_secret(self, token: str) -> str | None:
+        try:
+            return self.fernet.decrypt(token.encode()).decode()
+        except (InvalidToken, ValueError):
+            return None
 
     def hmac_sender(self, user_id: int) -> str:
         return hmac.new(self._key, str(int(user_id)).encode(), hashlib.sha256).hexdigest()

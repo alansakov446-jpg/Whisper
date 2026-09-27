@@ -30,6 +30,10 @@ def commands_for(lang: str) -> list[BotCommand]:
         BotCommand(command="send", description=t(lang, "cmd_send")),
         BotCommand(command="settings", description=t(lang, "cmd_settings")),
         BotCommand(command="cgn", description=t(lang, "cmd_cgn")),
+        BotCommand(command="convert", description=t(lang, "cmd_convert")),
+        BotCommand(command="myconvert", description=t(lang, "cmd_myconvert")),
+        BotCommand(command="search", description=t(lang, "cmd_search")),
+        BotCommand(command="pins", description=t(lang, "cmd_pins")),
         BotCommand(command="stats", description=t(lang, "cmd_stats")),
         BotCommand(command="export", description=t(lang, "cmd_export")),
         BotCommand(command="nomedia", description=t(lang, "cmd_nomedia")),
@@ -69,6 +73,8 @@ async def run_bot(settings: Settings, fernet_key: str) -> None:
     bot = Bot(settings.bot_token, default=DefaultBotProperties(protect_content=False))
     dp = build_dispatcher(session_factory)
     dp.workflow_data["cipher"] = cipher
+    dp.workflow_data["web_base_url"] = settings.web_base_url
+    dp.workflow_data["session_factory"] = session_factory
     username = "bot"
     runner = None
     scheduler = AsyncIOScheduler(timezone="UTC")

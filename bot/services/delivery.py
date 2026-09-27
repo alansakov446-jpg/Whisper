@@ -8,7 +8,18 @@ from bot.db import repo
 from bot.services.i18n import t
 from bot.services.views import envelope_buttons, envelope_text
 from bot.services.whisper_service import add_delivery_ref, split_caption
-from bot.utils.time import as_naive_utc
+from bot.utils.time import as_naive_utc, in_quiet_hours, utcnow
+
+
+async def member_in_quiet_hours(session, user_id: int, whisper) -> bool:
+    """True when the recipient should not see this delivery right now.
+
+    Only replies to a group whisper respect quiet hours.
+    """
+    user = await repo.get_user(session, user_id)
+    if user is None:
+        return False
+    return in_quiet_hours(utcnow(), getattr(user, "quiet_from", None), getattr(user, "quiet_to", None))
 
 
 @dataclass
@@ -68,14 +79,29 @@ async def send_media(bot, chat_id: int, media_type: str, file_id: str, caption: 
     raise ValueError(media_type)
 
 
-async def send_opened_content(bot, chat_id: int, plan, token: str, lang: str):
+async def send_opened_content(bot, chat_id: int, plan, token: str, lang: str, extra_rows=None):
     from bot.keyboards.builders import markup
     from bot.services.views import pager_buttons
 
-    keyboard = markup(pager_buttons(token, plan.page, plan.pages))
+    rows = pager_buttons(token, plan.page, plan.pages)
+    if extra_rows:
+        rows = list(rows) + list(extra_rows)
+    keyboard = markup(rows)
+    extra_files = list(getattr(plan, "media_files", None) or [])
     if plan.media_type and plan.media_file_id:
         caption, overflow = split_caption(plan.header, plan.body)
         await send_media(bot, chat_id, plan.media_type, plan.media_file_id, caption, keyboard if not overflow else None)
+        if overflow:
+            await bot.send_message(chat_id, overflow, protect_content=True, reply_markup=keyboard)
+        for kind, file_id in extra_files:
+            await send_media(bot, chat_id, kind, file_id, None, None)
+        return
+    if extra_files:
+        first, rest = extra_files[0], extra_files[1:]
+        caption, overflow = split_caption(plan.header, plan.body)
+        await send_media(bot, chat_id, first[0], first[1], caption, None)
+        for kind, file_id in rest:
+            await send_media(bot, chat_id, kind, file_id, None, None)
         if overflow:
             await bot.send_message(chat_id, overflow, protect_content=True, reply_markup=keyboard)
         return
@@ -116,6 +142,8 @@ async def deliver_outgoing(bot, session, whisper, bot_username: str) -> Delivery
         )
         for member in members:
             if whisper.sender_id and member.user_id == whisper.sender_id:
+                continue
+            if whisper.reply_to_id is not None and await member_in_quiet_hours(session, member.user_id, whisper):
                 continue
             try:
                 message = await bot.send_message(member.user_id, text, protect_content=True, reply_markup=keyboard)

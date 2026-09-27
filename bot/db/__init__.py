@@ -1,7 +1,18 @@
 """Database models and sessions."""
 
 from bot.db.base import Base
-from bot.db.models import Contact, Group, GroupInvite, GroupMember, PendingMedia, ReadReceipt, User, Whisper
+from bot.db.models import (
+    Contact,
+    Group,
+    GroupInvite,
+    GroupMember,
+    MediaKey,
+    PendingMedia,
+    Pin,
+    ReadReceipt,
+    User,
+    Whisper,
+)
 
 __all__ = [
     "Base",
@@ -9,7 +20,9 @@ __all__ = [
     "Group",
     "GroupInvite",
     "GroupMember",
+    "MediaKey",
     "PendingMedia",
+    "Pin",
     "ReadReceipt",
     "User",
     "Whisper",

@@ -15,8 +15,8 @@ from bot.services.whisper_service import (
 from bot.utils.time import utcnow
 
 
-async def edit_destroyed_messages(bot, whisper) -> int:
-    text = t(whisper.lang, "destroyed")
+async def edit_destroyed_messages(bot, whisper, text: str | None = None) -> int:
+    text = text or t(whisper.lang, "destroyed")
     edited = 0
     seen: set[tuple] = set()
     for ref in collect_refs(whisper):

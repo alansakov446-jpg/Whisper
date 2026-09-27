@@ -109,6 +109,48 @@ async def ask_pseudo(callback: CallbackQuery, db_user: User, state: FSMContext) 
     await callback.answer()
 
 
+@router.callback_query(F.data == "set:seal")
+async def set_seal(callback: CallbackQuery, db_user: User) -> None:
+    db_user.seal_default = not bool(db_user.seal_default)
+    await show_settings(callback, db_user, edit=True)
+
+
+@router.callback_query(F.data == "set:quiet")
+async def ask_quiet(callback: CallbackQuery, db_user: User, state: FSMContext) -> None:
+    await state.set_state(SettingsFlow.quiet)
+    if callback.message:
+        await callback.message.answer(t(db_user.lang, "quiet_ask"))
+    await callback.answer()
+
+
+@router.message(SettingsFlow.quiet, F.text, ~F.text.startswith("/"))
+async def save_quiet(message: Message, state: FSMContext, db_user: User) -> None:
+    from bot.utils.time import parse_hhmm
+
+    raw = (message.text or "").strip().lower().replace("ё", "е")
+    if raw in {"выкл", "off", "-", "нет", "none"}:
+        db_user.quiet_from = None
+        db_user.quiet_to = None
+        await state.clear()
+        await message.answer(t(db_user.lang, "quiet_off"))
+        await show_settings(message, db_user)
+        return
+    parts = raw.replace("—", "-").replace("до", " ").split()
+    times: list[str] = []
+    for part in parts:
+        for piece in part.split("-"):
+            if piece.strip():
+                times.append(piece.strip())
+    if len(times) != 2 or parse_hhmm(times[0]) is None or parse_hhmm(times[1]) is None:
+        await message.answer(t(db_user.lang, "quiet_bad"))
+        return
+    db_user.quiet_from = times[0]
+    db_user.quiet_to = times[1]
+    await state.clear()
+    await message.answer(t(db_user.lang, "quiet_saved", value=f"{times[0]}-{times[1]}"))
+    await show_settings(message, db_user)
+
+
 @router.message(SettingsFlow.pseudonym, F.text, ~F.text.startswith("/"))
 async def save_pseudo(message: Message, state: FSMContext, db_user: User) -> None:
     ok, value = parse_pseudonym(message.text)

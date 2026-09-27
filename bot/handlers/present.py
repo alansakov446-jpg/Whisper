@@ -50,7 +50,7 @@ async def refresh_envelopes(bot, session, whisper, bot_username: str) -> None:
             logger.info("envelope refresh failed: {}", type(exc).__name__)
 
 
-async def answer_open_callback(callback, bot, plan, token: str, lang: str, bot_username: str) -> None:
+async def answer_open_callback(callback, bot, plan, token: str, lang: str, bot_username: str, extra_rows=None) -> None:
     if plan.status != "ok":
         await _alert(callback, plan.message)
         if plan.status == "destroyed" and callback.inline_message_id:
@@ -63,12 +63,12 @@ async def answer_open_callback(callback, bot, plan, token: str, lang: str, bot_u
             except Exception:
                 logger.info("could not edit destroyed inline message")
         return
-    if plan.use_alert and not plan.media_type:
+    if plan.use_alert and not plan.media_type and not getattr(plan, "media_files", None):
         await _alert(callback, plan.message)
         return
     chat_id = callback.from_user.id
     try:
-        await send_opened_content(bot, chat_id, plan, token, lang)
+        await send_opened_content(bot, chat_id, plan, token, lang, extra_rows=extra_rows)
         await _alert(callback, t(lang, "opened_in_dm"), show_alert=False)
     except (TelegramForbiddenError, TelegramBadRequest):
         link = whisper_link(bot_username, token)

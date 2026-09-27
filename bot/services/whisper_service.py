@@ -5,6 +5,7 @@ import secrets
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.constants import (
@@ -39,6 +40,11 @@ class NewWhisper:
     is_group: bool = False
     media_type: str | None = None
     media_file_id: str | None = None
+    media_key: str | None = None
+    label: str | None = None
+    is_sealed: bool = False
+    seal_key_enc: str | None = None
+    reply_to_id: int | None = None
     ttl_seconds: int | None = None
     ttl_explicit: bool = False
     default_ttl: int | None = None
@@ -98,6 +104,11 @@ async def create_whisper(session: AsyncSession, cipher: Cipher, data: NewWhisper
         text=data.text,
         media_type=data.media_type,
         media_file_id=data.media_file_id,
+        media_key=data.media_key,
+        label=data.label,
+        is_sealed=bool(data.is_sealed),
+        seal_key_enc=data.seal_key_enc,
+        reply_to_id=data.reply_to_id,
         ttl_seconds=ttl_seconds,
         ttl_explicit=data.ttl_explicit or data.status != "draft",
         expires_at=expires_at,
@@ -115,7 +126,18 @@ async def create_whisper(session: AsyncSession, cipher: Cipher, data: NewWhisper
     )
     session.add(whisper)
     await session.flush()
+    if data.media_key and data.status != "draft":
+        await consume_media_key_use(session, data.media_key)
     return whisper
+
+
+async def consume_media_key_use(session: AsyncSession, key: str) -> None:
+    from bot.db.models import MediaKey
+
+    row = await session.scalar(select(MediaKey).where(MediaKey.key == key))
+    if row is not None:
+        row.use_count = (row.use_count or 0) + 1
+        await session.flush()
 
 
 async def remember_contact(
@@ -204,6 +226,8 @@ async def activate_draft(
     whisper.expires_at = compute_expires(now, whisper.ttl_seconds)
     whisper.status = "active"
     whisper.updated_at = now
+    if whisper.media_key:
+        await consume_media_key_use(session, whisper.media_key)
     if whisper.recipient_username or whisper.recipient_id:
         await remember_contact(session, sender_id, whisper.recipient_username, whisper.recipient_id, now)
     if whisper.media_file_id:
@@ -261,6 +285,7 @@ def destroy_whisper(whisper: Whisper, now: datetime) -> None:
     whisper.text = None
     whisper.media_file_id = None
     whisper.media_type = None
+    whisper.seal_key_enc = None
     whisper.status = "destroyed"
     whisper.destroyed_at = now
     whisper.updated_at = now
@@ -287,6 +312,49 @@ async def change_ttl(
     if whisper.expires_at is not None and whisper.expires_at <= now and whisper.status == "active":
         destroy_whisper(whisper, now)
         return "destroyed_now"
+    return "ok"
+
+
+async def extend_ttl(
+    session: AsyncSession,
+    whisper: Whisper,
+    actor_id: int,
+    extra_seconds: int,
+    cipher: Cipher,
+    now: datetime | None = None,
+) -> str:
+    """Add extra time to the current expiry. Forever whispers cannot extend."""
+    now = as_naive_utc(now) or utcnow()
+    if whisper.status == "destroyed":
+        return "destroyed"
+    if not is_sender(whisper, actor_id, cipher):
+        return "denied"
+    if whisper.ttl_seconds is None and whisper.expires_at is None:
+        return "forever"
+    base = as_naive_utc(whisper.expires_at) or as_naive_utc(whisper.send_at) or as_naive_utc(whisper.created_at) or now
+    if base <= now:
+        base = now
+    whisper.ttl_seconds = (whisper.ttl_seconds or 0) + int(extra_seconds)
+    whisper.ttl_explicit = True
+    whisper.expires_at = base + timedelta(seconds=int(extra_seconds))
+    whisper.updated_at = now
+    return "ok"
+
+
+async def delete_by_sender(
+    session: AsyncSession,
+    whisper: Whisper,
+    actor_id: int,
+    cipher: Cipher,
+    now: datetime | None = None,
+) -> str:
+    now = as_naive_utc(now) or utcnow()
+    if whisper.status == "destroyed":
+        return "destroyed"
+    if not is_sender(whisper, actor_id, cipher):
+        return "denied"
+    destroy_whisper(whisper, now)
+    await session.flush()
     return "ok"
 
 
@@ -343,6 +411,7 @@ class OpenPlan:
     header: str = ""
     body: str = ""
     should_destroy: bool = False
+    media_files: list = field(default_factory=list)
 
 
 def content_header(whisper: Whisper, viewer_id: int, cipher: Cipher, lang: str) -> str:
@@ -390,6 +459,7 @@ def plan_open(
     lang: str,
     page: int = 0,
     prefer_alert: bool = True,
+    seal_key: str | None = None,
 ) -> OpenPlan:
     ctx = AccessContext(
         user_id=viewer_id,
@@ -407,8 +477,17 @@ def plan_open(
         return OpenPlan(status="not_yet", message=t(lang, "not_yet"))
     if access == "deny":
         return OpenPlan(status="deny", message=t(lang, "not_yours"))
-    header = content_header(whisper, viewer_id, cipher, lang)
     body = whisper.text or ""
+    if whisper.is_sealed:
+        if not seal_key:
+            return OpenPlan(status="sealed", message=t(lang, "sealed_ask_key"), use_alert=True)
+        from bot.services.seal import seal_decrypt
+
+        opened = seal_decrypt(whisper.text or "", seal_key)
+        if opened is None:
+            return OpenPlan(status="sealed_bad_key", message=t(lang, "sealed_bad_key"), use_alert=True)
+        body = opened
+    header = content_header(whisper, viewer_id, cipher, lang)
     page_text, page, pages = paginate(header, body, page)
     use_alert = False
     message = page_text

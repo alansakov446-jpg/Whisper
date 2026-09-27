@@ -5,7 +5,18 @@ from datetime import datetime, timedelta
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.db.models import Contact, Group, GroupInvite, GroupMember, PendingMedia, ReadReceipt, User, Whisper
+from bot.db.models import (
+    Contact,
+    Group,
+    GroupInvite,
+    GroupMember,
+    MediaKey,
+    PendingMedia,
+    Pin,
+    ReadReceipt,
+    User,
+    Whisper,
+)
 from bot.utils.text import norm_username
 from bot.utils.time import as_naive_utc, utcnow
 
@@ -24,11 +35,15 @@ async def get_user_by_username(session: AsyncSession, username: str) -> User | N
 async def upsert_user(session: AsyncSession, tg_user) -> User:
     user = await session.get(User, tg_user.id)
     username = getattr(tg_user, "username", None)
+    first_name = getattr(tg_user, "first_name", None)
+    last_name = getattr(tg_user, "last_name", None)
     if user is None:
         lang_code = (getattr(tg_user, "language_code", None) or "").lower()
         user = User(
             id=tg_user.id,
             username=username,
+            first_name=first_name,
+            last_name=last_name,
             lang="en" if lang_code.startswith("en") else "ru",
             default_mode="open",
             notifications=True,
@@ -37,11 +52,25 @@ async def upsert_user(session: AsyncSession, tg_user) -> User:
         session.add(user)
         await session.flush()
         return user
+    changed = False
     if username and username != user.username:
         user.username = username
+        changed = True
+    if first_name and first_name != user.first_name:
+        user.first_name = first_name
+        changed = True
+    if last_name and last_name != user.last_name:
+        user.last_name = last_name
+        changed = True
+    if changed:
         rows = await session.scalars(select(GroupMember).where(GroupMember.user_id == user.id))
         for row in rows.all():
-            row.username = username
+            row.username = user.username
+        contacts = await session.scalars(select(Contact).where(Contact.contact_user_id == user.id))
+        for row in contacts.all():
+            row.username = user.username
+            row.first_name = user.first_name
+            row.last_name = user.last_name
     return user
 
 
@@ -148,10 +177,18 @@ async def upsert_contact(
     username: str | None,
     contact_user_id: int | None,
     now: datetime,
+    first_name: str | None = None,
+    last_name: str | None = None,
 ) -> Contact | None:
     username = norm_username(username) if username else None
     if not username and not contact_user_id:
         return None
+    if contact_user_id and first_name is None:
+        user = await get_user(session, contact_user_id)
+        if user is not None:
+            username = username or user.username
+            first_name = user.first_name
+            last_name = user.last_name
     existing = None
     if username:
         existing = await session.scalar(
@@ -167,11 +204,17 @@ async def upsert_contact(
             existing.username = username
         if contact_user_id:
             existing.contact_user_id = contact_user_id
+        if first_name is not None:
+            existing.first_name = first_name
+        if last_name is not None:
+            existing.last_name = last_name
         return existing
     contact = Contact(
         owner_id=owner_id,
         username=username,
         contact_user_id=contact_user_id,
+        first_name=first_name,
+        last_name=last_name,
         last_used_at=now,
     )
     session.add(contact)
@@ -181,7 +224,10 @@ async def upsert_contact(
 
 async def list_contacts(session: AsyncSession, owner_id: int, limit: int = 20) -> list[Contact]:
     rows = await session.scalars(
-        select(Contact).where(Contact.owner_id == owner_id).order_by(Contact.last_used_at.desc()).limit(limit)
+        select(Contact)
+        .where(Contact.owner_id == owner_id)
+        .order_by(Contact.favorite.desc(), Contact.last_used_at.desc())
+        .limit(limit)
     )
     return list(rows.all())
 
@@ -371,3 +417,146 @@ async def count_contacts(session: AsyncSession, owner_id: int) -> int:
 
 async def get_receipt(session: AsyncSession, whisper_id: int, user_id: int) -> ReadReceipt | None:
     return await session.get(ReadReceipt, (whisper_id, user_id))
+
+
+# --- v2: media keys ---------------------------------------------------------
+
+async def get_media_key(session: AsyncSession, key: str) -> MediaKey | None:
+    return await session.scalar(select(MediaKey).where(MediaKey.key == key))
+
+
+async def get_media_key_by_group(session: AsyncSession, media_group: str) -> MediaKey | None:
+    return await session.scalar(select(MediaKey).where(MediaKey.media_group == media_group))
+
+
+async def list_media_keys(session: AsyncSession, owner_id: int, limit: int = 20) -> list[MediaKey]:
+    rows = await session.scalars(
+        select(MediaKey).where(MediaKey.owner_id == owner_id).order_by(MediaKey.created_at.desc()).limit(limit)
+    )
+    return list(rows.all())
+
+
+async def count_recent_media_keys(session: AsyncSession, owner_id: int, now: datetime, window: int) -> int:
+    since = now - timedelta(seconds=window)
+    value = await session.scalar(
+        select(func.count())
+        .select_from(MediaKey)
+        .where(MediaKey.owner_id == owner_id, MediaKey.created_at >= since)
+    )
+    return int(value or 0)
+
+
+async def create_media_key(
+    session: AsyncSession,
+    *,
+    key: str,
+    owner_id: int,
+    files: str,
+    media_group: str | None = None,
+    multi_use: bool = True,
+    expires_at: datetime | None = None,
+    now: datetime,
+) -> MediaKey:
+    row = MediaKey(
+        key=key,
+        owner_id=owner_id,
+        files=files,
+        media_group=media_group,
+        multi_use=multi_use,
+        use_count=0,
+        expires_at=expires_at,
+        created_at=now,
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
+async def delete_media_key(session: AsyncSession, owner_id: int, key: str) -> bool:
+    row = await get_media_key(session, key)
+    if row is None or row.owner_id != owner_id:
+        return False
+    await session.delete(row)
+    await session.flush()
+    session.expunge(row)
+    return True
+
+
+# --- v2: pins ---------------------------------------------------------------
+
+async def add_pin(session: AsyncSession, user_id: int, whisper_id: int, now: datetime) -> Pin:
+    row = await session.get(Pin, (user_id, whisper_id))
+    if row is None:
+        row = Pin(user_id=user_id, whisper_id=whisper_id, created_at=now)
+        session.add(row)
+        await session.flush()
+    return row
+
+
+async def remove_pin(session: AsyncSession, user_id: int, whisper_id: int) -> bool:
+    row = await session.get(Pin, (user_id, whisper_id))
+    if row is None:
+        return False
+    await session.delete(row)
+    await session.flush()
+    session.expunge(row)
+    return True
+
+
+async def is_pinned(session: AsyncSession, user_id: int, whisper_id: int) -> bool:
+    return await session.get(Pin, (user_id, whisper_id)) is not None
+
+
+async def list_pins(session: AsyncSession, user_id: int, limit: int = 20) -> list[tuple[Pin, Whisper]]:
+    rows = await session.execute(
+        select(Pin, Whisper)
+        .join(Whisper, Whisper.id == Pin.whisper_id)
+        .where(Pin.user_id == user_id)
+        .order_by(Pin.created_at.desc())
+        .limit(limit)
+    )
+    return [(pin, whisper) for pin, whisper in rows.all()]
+
+
+# --- v2: favourites ---------------------------------------------------------
+
+async def set_contact_favorite(session: AsyncSession, owner_id: int, contact_id: int, favorite: bool) -> bool:
+    contact = await get_contact(session, owner_id, contact_id)
+    if contact is None:
+        return False
+    contact.favorite = favorite
+    return True
+
+
+# --- v2: search -------------------------------------------------------------
+
+async def search_whispers(
+    session: AsyncSession,
+    user_id: int,
+    sender_hmac: str,
+    query: str,
+    limit: int = 10,
+) -> list[Whisper]:
+    pattern = f"%{query}%"
+    member_groups = select(GroupMember.group_id).where(GroupMember.user_id == user_id)
+    rows = await session.scalars(
+        select(Whisper)
+        .where(
+            Whisper.status.in_(("active", "scheduled")),
+            Whisper.text.ilike(pattern),
+            or_(
+                Whisper.sender_hmac == sender_hmac,
+                Whisper.recipient_id == user_id,
+                (Whisper.is_group.is_(True) & Whisper.group_id.in_(member_groups)),
+            ),
+        )
+        .order_by(Whisper.created_at.desc())
+        .limit(limit)
+    )
+    return list(rows.all())
+
+
+# --- v2: group invite tokens ------------------------------------------------
+
+async def find_group_by_invite_token(session: AsyncSession, token: str) -> Group | None:
+    return await session.scalar(select(Group).where(Group.invite_token == token, Group.auto_join.is_(True)))

@@ -17,8 +17,9 @@ from bot.services.crypto import Cipher
 from bot.services.export_stats import export_user, user_stats
 from bot.services.i18n import media_kind, t
 from bot.services.media_info import extract_media, media_too_big
-from bot.services.views import ButtonSpec, display_user, main_menu
-from bot.utils.time import utcnow
+from bot.services.views import ButtonSpec, clip_button, display_user, main_menu
+from bot.utils.text import clip
+from bot.utils.time import format_human, utcnow
 
 router = Router(name="misc")
 
@@ -72,6 +73,70 @@ async def cmd_nomedia(message: Message, session: AsyncSession, db_user: User) ->
     await message.answer(t(db_user.lang, "media_cleared"))
 
 
+@router.message(Command("search"))
+async def cmd_search(
+    message: Message,
+    command,
+    session: AsyncSession,
+    db_user: User,
+    cipher: Cipher,
+    state: FSMContext,
+) -> None:
+    await state.clear()
+    if not is_private(message):
+        await message.answer(t(db_user.lang, "private_only"))
+        return
+    args = (getattr(command, "args", None) or "").strip()
+    if not args:
+        await message.answer(t(db_user.lang, "search_usage"))
+        return
+    from bot.utils.text import preview
+
+    results = await repo.search_whispers(session, db_user.id, cipher.hmac_sender(db_user.id), args, limit=10)
+    if not results:
+        await message.answer(t(db_user.lang, "search_empty", query=clip(args, 32)))
+        return
+    rows = []
+    for whisper in results:
+        label = t(
+            db_user.lang,
+            "search_hit",
+            when=format_human(whisper.created_at),
+            preview=preview(whisper.text or whisper.media_type or whisper.status, 24),
+        )
+        rows.append([ButtonSpec(clip_button(label, 60), callback_data=f"open:{whisper.token}")])
+    await message.answer(t(db_user.lang, "search_title"), reply_markup=markup(rows))
+
+
+@router.message(Command("pins"))
+async def cmd_pins(message: Message, session: AsyncSession, db_user: User, state: FSMContext) -> None:
+    await state.clear()
+    if not is_private(message):
+        await message.answer(t(db_user.lang, "private_only"))
+        return
+    from bot.utils.text import preview
+
+    pins = await repo.list_pins(session, db_user.id, limit=20)
+    if not pins:
+        await message.answer(t(db_user.lang, "pins_empty"))
+        return
+    rows = []
+    for _pin, whisper in pins:
+        label = t(
+            db_user.lang,
+            "search_hit",
+            when=format_human(whisper.created_at),
+            preview=preview(whisper.text or whisper.media_type or whisper.status, 24),
+        )
+        rows.append(
+            [
+                ButtonSpec(clip_button(label, 48), callback_data=f"open:{whisper.token}"),
+                ButtonSpec(t(db_user.lang, "delete"), callback_data=f"unpin:{whisper.token}"),
+            ]
+        )
+    await message.answer(t(db_user.lang, "pins_title"), reply_markup=markup(rows))
+
+
 @router.callback_query(F.data == "menu:contacts")
 async def menu_contacts(callback: CallbackQuery, session: AsyncSession, db_user: User) -> None:
     contacts = await repo.list_contacts(session, db_user.id, limit=20)
@@ -85,15 +150,41 @@ async def menu_contacts(callback: CallbackQuery, session: AsyncSession, db_user:
         return
     rows = []
     for contact in contacts:
-        label = display_user(contact.username, contact.contact_user_id, lang)
-        rows.append(
-            [
-                ButtonSpec(label, callback_data=f"sendto:u:{contact.username}" if contact.username else f"sendto:id:{contact.contact_user_id}"),
-                ButtonSpec(t(lang, "delete"), callback_data=f"contact:del:{contact.id}"),
-            ]
+        label = (
+            ("⭐ " if contact.favorite else "")
+            + display_user(
+                contact.username,
+                contact.contact_user_id,
+                lang,
+                contact.first_name,
+                contact.last_name,
+            )
         )
+        row = [
+            ButtonSpec(
+                label,
+                callback_data=f"sendto:u:{contact.username}" if contact.username else f"sendto:id:{contact.contact_user_id}",
+            )
+        ]
+        if not contact.username and contact.contact_user_id:
+            row.append(ButtonSpec("🔗", url=f"tg://user?id={contact.contact_user_id}"))
+        row.append(ButtonSpec("⭐" if not contact.favorite else "☆", callback_data=f"contact:fav:{contact.id}"))
+        row.append(ButtonSpec(t(lang, "delete"), callback_data=f"contact:del:{contact.id}"))
+        rows.append(row)
     rows.append([ButtonSpec(t(lang, "back"), callback_data="menu:main")])
     await edit_or_send(callback, t(lang, "contacts_title"), markup(rows))
+
+
+@router.callback_query(F.data.startswith("contact:fav:"))
+async def favorite_contact_cb(callback: CallbackQuery, session: AsyncSession, db_user: User) -> None:
+    contact_id = int(callback.data.split(":")[-1])
+    contact = await repo.get_contact(session, db_user.id, contact_id)
+    if contact is None:
+        await callback.answer(t(db_user.lang, "not_found"), show_alert=True)
+        return
+    await repo.set_contact_favorite(session, db_user.id, contact_id, not contact.favorite)
+    await callback.answer()
+    await menu_contacts(callback, session, db_user)
 
 
 @router.callback_query(F.data.startswith("contact:del:"))

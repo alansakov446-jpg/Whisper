@@ -14,14 +14,23 @@ from bot.services.crypto import Cipher
 from bot.services.deeplink import parse_start_payload
 from bot.services.delivery import send_opened_content
 from bot.services.i18n import instruction, t
-from bot.services.views import main_menu, ttl_choice_keyboard
+from bot.services.views import main_menu, sender_actions_keyboard, ttl_choice_keyboard
 from bot.services.whisper_service import destroy_whisper, plan_open, record_open
 from bot.utils.time import utcnow
 
 router = Router(name="start")
 
 
-async def open_whisper_chat(message: Message, session: AsyncSession, db_user: User, cipher: Cipher, bot, token: str) -> bool:
+async def open_whisper_chat(
+    message: Message,
+    session: AsyncSession,
+    db_user: User,
+    cipher: Cipher,
+    bot,
+    token: str,
+    state=None,
+    seal_key: str | None = None,
+) -> bool:
     whisper = await repo.get_whisper_by_token(session, token)
     if whisper is None:
         await message.answer(t(db_user.lang, "deep_not_found"))
@@ -37,14 +46,37 @@ async def open_whisper_chat(message: Message, session: AsyncSession, db_user: Us
         now=utcnow(),
         lang=db_user.lang,
         prefer_alert=False,
+        seal_key=seal_key,
     )
     if plan.should_destroy:
         destroy_whisper(whisper, utcnow())
+    if plan.status in {"sealed", "sealed_bad_key"}:
+        if state is not None:
+            from bot.states import SealFlow
+
+            await state.set_state(SealFlow.key)
+            await state.update_data(token=token)
+        await message.answer(t(db_user.lang, "sealed_bad_key" if plan.status == "sealed_bad_key" else "sealed_ask_key"))
+        return False
     if plan.status != "ok":
         await message.answer(plan.message, protect_content=True)
         return False
     await record_open(session, whisper, db_user.id, db_user.username, utcnow())
-    await send_opened_content(bot, message.chat.id, plan, whisper.token, db_user.lang)
+    from bot.services import convert as convert_service
+
+    files = await convert_service.key_files(session, whisper.media_key, utcnow())
+    plan.media_files = [(item.get("type") or "document", item.get("file_id")) for item in files if item.get("file_id")]
+    from bot.services.views import open_actions_keyboard
+
+    pinned = await repo.is_pinned(session, db_user.id, whisper.id)
+    await send_opened_content(
+        bot,
+        message.chat.id,
+        plan,
+        whisper.token,
+        db_user.lang,
+        extra_rows=open_actions_keyboard(db_user.lang, whisper.token, pinned=pinned),
+    )
     return True
 
 
@@ -66,12 +98,15 @@ async def cmd_start(
     payload = parse_start_payload(command.args if command else None)
     lang = db_user.lang
     if payload.kind == "whisper" and payload.token:
-        await open_whisper_chat(message, session, db_user, cipher, bot, payload.token)
+        await open_whisper_chat(message, session, db_user, cipher, bot, payload.token, state=state)
         if just_started:
             await message.answer(instruction(lang, bot_username), reply_markup=markup(main_menu(lang)))
         return
     if payload.kind == "ttl" and payload.token:
         await show_ttl_editor(message, session, db_user, cipher, payload.token)
+        return
+    if payload.kind == "group_invite" and payload.token:
+        await show_group_invite(message, session, db_user, bot_username, payload.token)
         return
     if payload.kind == "group" and payload.group_id is not None:
         await show_group_link(message, session, db_user, bot_username, payload.group_id)
@@ -79,6 +114,25 @@ async def cmd_start(
     if payload.kind == "unknown":
         await message.answer(t(lang, "unknown_link"))
     await message.answer(instruction(lang, bot_username), reply_markup=markup(main_menu(lang)))
+
+
+async def show_group_invite(
+    message: Message,
+    session: AsyncSession,
+    db_user: User,
+    bot_username: str,
+    token: str,
+) -> None:
+    from bot.handlers.groups import send_group_card
+
+    group = await repo.find_group_by_invite_token(session, token)
+    if group is None:
+        await message.answer(t(db_user.lang, "group_not_found"))
+        return
+    if not await repo.is_member(session, group.id, db_user.id):
+        await repo.add_member(session, group.id, db_user.id, db_user.username, utcnow())
+        await message.answer(t(db_user.lang, "group_joined_invite", name=group.name))
+    await send_group_card(message, session, db_user, bot_username, group)
 
 
 async def show_ttl_editor(message: Message, session: AsyncSession, db_user: User, cipher: Cipher, token: str) -> None:
@@ -96,7 +150,14 @@ async def show_ttl_editor(message: Message, session: AsyncSession, db_user: User
         return
     await message.answer(
         t(db_user.lang, "ttl_pick"),
-        reply_markup=markup(ttl_choice_keyboard(db_user.lang, token, whisper.ttl_seconds)),
+        reply_markup=markup(
+            ttl_choice_keyboard(db_user.lang, token, whisper.ttl_seconds)
+            + sender_actions_keyboard(
+                db_user.lang,
+                token,
+                can_extend=whisper.ttl_seconds is not None or whisper.expires_at is not None,
+            )
+        ),
     )
 
 

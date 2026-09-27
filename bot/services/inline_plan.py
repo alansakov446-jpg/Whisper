@@ -7,7 +7,7 @@ from bot.constants import TOKEN_BYTES
 from bot.services.i18n import format_ttl, t
 from bot.services.parser import ParsedQuery
 from bot.services.ttl import resolve_ttl
-from bot.services.views import ButtonSpec, envelope_buttons, envelope_text
+from bot.services.views import ButtonSpec, contact_star, display_user, envelope_buttons, envelope_text
 from bot.utils.text import clip
 
 
@@ -27,6 +27,9 @@ class DraftSpec:
     media_type: str | None = None
     media_file_id: str | None = None
     group_size: int = 0
+    media_key: str | None = None
+    label: str | None = None
+    is_sealed: bool = False
 
 
 @dataclass
@@ -82,12 +85,13 @@ def _send_article(
         sender_username=sender_username,
         delivery_mode="inline",
         ttl_seconds=draft.ttl_seconds,
+        label=draft.label,
     )
     buttons = envelope_buttons(
         lang=lang,
         token=draft.token,
         bot_username=bot_username,
-        has_media=bool(draft.media_file_id),
+        has_media=bool(draft.media_file_id) or bool(draft.media_key),
     )
     return InlineArticle(
         result_id=draft.token,
@@ -119,6 +123,26 @@ def _variants(base: DraftSpec, lang: str, bot_username: str, title_for, descript
     return articles
 
 
+def _person_label(
+    kind: str,
+    value: str | int,
+    lang: str,
+    id_users: dict[int, object] | None,
+) -> str:
+    if kind == "username":
+        return f"@{value}"
+    user = (id_users or {}).get(int(value))
+    if user is not None:
+        return display_user(
+            getattr(user, "username", None),
+            int(value),
+            lang,
+            getattr(user, "first_name", None),
+            getattr(user, "last_name", None),
+        )
+    return t(lang, "id_link", id=value)
+
+
 def build_inline_plan(
     parsed: ParsedQuery,
     *,
@@ -136,6 +160,9 @@ def build_inline_plan(
     media_type: str | None = None,
     media_file_id: str | None = None,
     group_match: tuple[int, str, int] | None = None,
+    id_users: dict[int, object] | None = None,
+    media_key_status: str | None = None,
+    contact_info: list[dict] | None = None,
 ) -> InlinePlan:
     if not activated:
         return InlinePlan(
@@ -177,86 +204,199 @@ def build_inline_plan(
                 _instruction(lang, bot_username),
             ]
         )
+    if media_key_status in {"missing", "not_yours"}:
+        message = t(lang, "convert_missing" if media_key_status == "missing" else "convert_not_yours")
+        return InlinePlan(
+            articles=[
+                InlineArticle(
+                    result_id="mkey",
+                    title=message,
+                    description=t(lang, "convert_ask"),
+                    message_text=message,
+                    buttons=[],
+                )
+            ]
+        )
 
-    has_payload = bool(parsed.text) or bool(media_file_id)
+    has_payload = bool(parsed.text) or bool(media_file_id) or bool(parsed.media_key)
     articles: list[InlineArticle] = []
     explicit = parsed.ttl_explicit
     chosen_ttl = parsed.ttl_seconds if explicit else None
     resolved = resolve_ttl(explicit=explicit, chosen=chosen_ttl, default=default_ttl)
 
-    recipient_count = len(parsed.usernames) + len(parsed.user_ids)
-    if recipient_count == 1 and has_payload:
-        username = parsed.usernames[0] if parsed.usernames else None
-        user_id = parsed.user_ids[0] if parsed.user_ids else None
-        saved = (username in saved_usernames) or (user_id in saved_ids if user_id else False)
-        description = t(lang, "inline_saved_contact" if saved else "inline_new_contact")
-        if media_file_id:
-            description = t(lang, "open_in_bot") + " · " + description
-        title = (
-            t(lang, "inline_title_user", username=username)
-            if username
-            else t(lang, "inline_title_id", id=user_id)
+    refs = list(parsed.recipients)
+    if not refs:
+        # Back-compat: callers that feed only usernames/ids lists.
+        refs = []
+        for name in parsed.usernames:
+            refs.append(type("R", (), {"kind": "username", "value": name}))
+        for uid in parsed.user_ids:
+            refs.append(type("R", (), {"kind": "id", "value": uid}))
+
+    known_refs: list[tuple[str, object]] = []
+    unknown_ids: list[int] = []
+    for ref in refs:
+        if ref.kind == "id" and id_users is not None and id_users.get(int(ref.value)) is None:
+            unknown_ids.append(int(ref.value))
+            continue
+        known_refs.append((ref.kind, ref.value))
+
+    for uid in unknown_ids:
+        articles.append(
+            InlineArticle(
+                result_id=f"nouser{uid}",
+                title=t(lang, "inline_id_not_found", id=uid),
+                description=t(lang, "inline_type_text"),
+                message_text=t(lang, "inline_id_not_found", id=uid),
+                buttons=[],
+            )
         )
-        draft = DraftSpec(
-            token=_token(),
+
+    def single_draft(kind: str, value, token: str | None = None) -> DraftSpec:
+        return DraftSpec(
+            token=token or _token(),
             text=parsed.text or None,
-            recipient_id=user_id,
-            recipient_username=username,
+            recipient_id=int(value) if kind == "id" else None,
+            recipient_username=value if kind == "username" else getattr(id_users.get(int(value)), "username", None) if id_users else None,
             ttl_seconds=resolved,
             media_type=media_type,
             media_file_id=media_file_id,
+            media_key=parsed.media_key,
+            label=parsed.label,
+            is_sealed=parsed.sealed,
         )
+
+    def single_title(kind: str, value) -> str:
+        return t(lang, "inline_title_user", username=value) if kind == "username" else (
+            t(lang, "inline_title_person", name=_person_label(kind, value, lang, id_users))
+        )
+
+    def single_description(kind: str, value) -> str:
+        saved = (kind == "username" and value in saved_usernames) or (kind == "id" and int(value) in saved_ids)
+        description = t(lang, "inline_saved_contact" if saved else "inline_new_contact")
+        if media_file_id or parsed.media_key:
+            description = t(lang, "open_in_bot") + " · " + description
+        return description
+
+    recipient_count = len(known_refs)
+    if recipient_count == 1 and has_payload:
+        kind, value = known_refs[0]
+        draft = single_draft(kind, value)
         articles.append(
             _send_article(
                 lang=lang,
                 bot_username=bot_username,
-                title=title,
-                description=description,
+                title=single_title(kind, value),
+                description=single_description(kind, value),
                 draft=draft,
                 pseudonym=pseudonym,
                 sender_username=sender_username,
             )
         )
         if not explicit:
-            def title_for(label: str, username=username, user_id=user_id) -> str:
-                if username:
-                    return t(lang, "inline_ttl_variant", ttl=label, username=username)
-                return t(lang, "inline_ttl_variant_id", ttl=label, id=user_id)
+            def title_for(label: str, kind=kind, value=value) -> str:
+                if kind == "username":
+                    return t(lang, "inline_ttl_variant", ttl=label, username=value)
+                return t(lang, "inline_ttl_variant_person", ttl=label, name=_person_label(kind, value, lang, id_users))
 
-            articles.extend(_variants(draft, lang, bot_username, title_for, description, pseudonym, sender_username))
+            articles.extend(_variants(draft, lang, bot_username, title_for, single_description(kind, value), pseudonym, sender_username))
         articles.append(_instruction(lang, bot_username))
         return InlinePlan(articles=articles[:50])
 
-    if recipient_count > 1 and has_payload:
-        names = list(parsed.usernames)
-        ids = list(parsed.user_ids)
+    if recipient_count > 1:
+        id_known_count = sum(1 for kind, _ in known_refs if kind == "id")
+        names = [value for kind, value in known_refs if kind == "username"]
+        ids = [int(value) for kind, value in known_refs if kind == "id"]
         size = recipient_count + 1
+        if id_known_count >= 2:
+            # Several id= recipients: group / only-last / only-first.
+            shown_parts = [(_person_label(kind, value, lang, id_users)) for kind, value in known_refs[:4]]
+            group_name = clip(f"Шёпот: {', '.join(shown_parts)}" if lang != "en" else f"Whisper: {', '.join(shown_parts)}", 64)
+            group_draft = DraftSpec(
+                token=_token(),
+                text=parsed.text or None,
+                is_group=True,
+                new_group_usernames=list(names),
+                new_group_ids=list(ids),
+                new_group_name=group_name,
+                group_name=group_name,
+                group_size=size,
+                ttl_seconds=resolved,
+                media_type=media_type,
+                media_file_id=media_file_id,
+                media_key=parsed.media_key,
+                label=parsed.label,
+                is_sealed=parsed.sealed,
+            )
+            articles.append(
+                _send_article(
+                    lang=lang,
+                    bot_username=bot_username,
+                    title=t(lang, "inline_title_group", n=size),
+                    description=t(lang, "inline_create_group"),
+                    draft=group_draft,
+                    pseudonym=pseudonym,
+                    sender_username=sender_username,
+                )
+            )
+            last_kind, last_value = known_refs[-1]
+            first_kind, first_value = known_refs[0]
+            articles.append(
+                _send_article(
+                    lang=lang,
+                    bot_username=bot_username,
+                    title=t(lang, "inline_only_last"),
+                    description=single_title(last_kind, last_value),
+                    draft=single_draft(last_kind, last_value),
+                    pseudonym=pseudonym,
+                    sender_username=sender_username,
+                )
+            )
+            articles.append(
+                _send_article(
+                    lang=lang,
+                    bot_username=bot_username,
+                    title=t(lang, "inline_only_first"),
+                    description=single_title(first_kind, first_value),
+                    draft=single_draft(first_kind, first_value),
+                    pseudonym=pseudonym,
+                    sender_username=sender_username,
+                )
+            )
+            articles.append(_instruction(lang, bot_username))
+            return InlinePlan(articles=articles[:50])
+
+        # Several @usernames (optionally plus a single id): one group card.
         shown = ", ".join(f"@{name}" for name in names[:3])
         if ids:
-            shown = (shown + ", " if shown else "") + ", ".join(f"ID {item}" for item in ids[:2])
+            shown = (shown + ", " if shown else "") + ", ".join(
+                _person_label("id", item, lang, id_users) for item in ids[:2]
+            )
         group_name = clip(f"Шёпот: {shown}" if lang != "en" else f"Whisper: {shown}", 64)
         description = t(lang, "inline_create_group")
-        if media_file_id:
+        if media_file_id or parsed.media_key:
             description = t(lang, "open_in_bot") + " · " + description
-        title = t(lang, "inline_title_group", n=size)
         draft = DraftSpec(
             token=_token(),
             text=parsed.text or None,
             is_group=True,
-            new_group_usernames=names,
-            new_group_ids=ids,
+            new_group_usernames=list(names),
+            new_group_ids=list(ids),
             new_group_name=group_name,
             group_name=group_name,
             group_size=size,
             ttl_seconds=resolved,
             media_type=media_type,
             media_file_id=media_file_id,
+            media_key=parsed.media_key,
+            label=parsed.label,
+            is_sealed=parsed.sealed,
         )
         articles.append(
             _send_article(
                 lang=lang,
                 bot_username=bot_username,
-                title=title,
+                title=t(lang, "inline_title_group", n=size),
                 description=description,
                 draft=draft,
                 pseudonym=pseudonym,
@@ -315,6 +455,9 @@ def build_inline_plan(
             ttl_seconds=resolved,
             media_type=media_type,
             media_file_id=media_file_id,
+            media_key=parsed.media_key,
+            label=parsed.label,
+            is_sealed=parsed.sealed,
         )
         articles.append(
             _send_article(
@@ -330,11 +473,21 @@ def build_inline_plan(
         articles.append(_instruction(lang, bot_username))
         return InlinePlan(articles=articles)
 
+    contact_cards = _contact_entries(contacts, contact_info, lang)
+
     if has_payload:
-        for username, user_id in contacts[:8]:
-            if not username and not user_id:
-                continue
-            label = f"@{username}" if username else f"ID {user_id}"
+        if not unknown_ids:
+            articles.insert(
+                0,
+                InlineArticle(
+                    result_id="norecipient",
+                    title=t(lang, "inline_no_recipient"),
+                    description=t(lang, "inline_type_text"),
+                    message_text=t(lang, "inline_no_recipient"),
+                    buttons=[],
+                ),
+            )
+        for username, user_id, label in contact_cards[:8]:
             draft = DraftSpec(
                 token=_token(),
                 text=parsed.text or None,
@@ -343,19 +496,21 @@ def build_inline_plan(
                 ttl_seconds=resolved,
                 media_type=media_type,
                 media_file_id=media_file_id,
+                media_key=parsed.media_key,
+                label=parsed.label,
+                is_sealed=parsed.sealed,
             )
             articles.append(
                 _send_article(
                     lang=lang,
                     bot_username=bot_username,
-                    title=t(lang, "inline_title_user", username=username) if username else t(lang, "inline_title_id", id=user_id),
+                    title=t(lang, "inline_title_user", username=username) if username else t(lang, "inline_title_person", name=label),
                     description=t(lang, "inline_saved_contact"),
                     draft=draft,
                     pseudonym=pseudonym,
                     sender_username=sender_username,
                 )
             )
-            _ = label
         for gid, name, size in groups[:5]:
             draft = DraftSpec(
                 token=_token(),
@@ -367,6 +522,9 @@ def build_inline_plan(
                 ttl_seconds=resolved,
                 media_type=media_type,
                 media_file_id=media_file_id,
+                media_key=parsed.media_key,
+                label=parsed.label,
+                is_sealed=parsed.sealed,
             )
             articles.append(
                 _send_article(
@@ -383,7 +541,7 @@ def build_inline_plan(
             articles.append(
                 InlineArticle(
                     result_id="empty",
-                    title=t(lang, "inline_empty_text") if not parsed.text else t(lang, "inline_type_text"),
+                    title=t(lang, "inline_type_text") if not parsed.text else t(lang, "inline_type_text"),
                     description=t(lang, "inline_new_contact"),
                     message_text=t(lang, "inline_type_text"),
                     buttons=[],
@@ -393,17 +551,16 @@ def build_inline_plan(
         return InlinePlan(articles=articles[:50])
 
     articles.append(_instruction(lang, bot_username))
-    for username, user_id in contacts[:8]:
-        if username:
-            articles.append(
-                InlineArticle(
-                    result_id=f"hintu{username}",
-                    title=f"📇 @{username}",
-                    description=t(lang, "inline_saved_contact"),
-                    message_text=t(lang, "inline_hint_contact", username=username),
-                    buttons=[],
-                )
+    for username, user_id, label in contact_cards[:8]:
+        articles.append(
+            InlineArticle(
+                result_id=f"hintu{username or user_id}",
+                title=f"📇 {label}",
+                description=t(lang, "inline_saved_contact"),
+                message_text=t(lang, "inline_hint_contact", username=username or label),
+                buttons=[],
             )
+        )
     for gid, name, size in groups[:5]:
         articles.append(
             InlineArticle(
@@ -426,3 +583,28 @@ def build_inline_plan(
             ),
         )
     return InlinePlan(articles=articles[:50])
+
+
+def _contact_entries(
+    contacts: list[tuple[str | None, int | None]],
+    contact_info: list[dict] | None,
+    lang: str,
+) -> list[tuple[str | None, int | None, str]]:
+    entries: list[tuple[str | None, int | None, str]] = []
+    if contact_info is not None:
+        for item in contact_info:
+            label = display_user(
+                item.get("username"),
+                item.get("user_id"),
+                lang,
+                item.get("first_name"),
+                item.get("last_name"),
+            )
+            entries.append((item.get("username"), item.get("user_id"), contact_star(bool(item.get("favorite"))) + label))
+        return entries
+    for username, user_id in contacts:
+        if not username and not user_id:
+            continue
+        label = f"@{username}" if username else t(lang, "id_label", id=user_id)
+        entries.append((username, user_id, label))
+    return entries

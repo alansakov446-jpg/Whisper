@@ -14,9 +14,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.db import repo
 from bot.db.models import User
 from bot.keyboards.builders import markup
+from bot.services import convert
 from bot.services.crypto import Cipher
 from bot.services.inline_plan import InlinePlan, build_inline_plan
 from bot.services.parser import parse_inline_query
+from bot.services.seal import new_seal_key, seal_encrypt
 from bot.services.whisper_service import NewWhisper, activate_draft, create_whisper, is_rate_limited
 from bot.handlers.common import notify_added
 from bot.services.i18n import t
@@ -60,6 +62,13 @@ async def persist_drafts(session: AsyncSession, cipher: Cipher, db_user: User, p
                 "user_ids": draft.new_group_ids,
                 "name": draft.new_group_name,
             }
+        text = draft.text
+        seal_key_enc = None
+        if draft.is_sealed:
+            seal_key = new_seal_key()
+            if text:
+                text = seal_encrypt(text, seal_key)
+            seal_key_enc = cipher.encrypt_secret(seal_key)
         await create_whisper(
             session,
             cipher,
@@ -68,7 +77,7 @@ async def persist_drafts(session: AsyncSession, cipher: Cipher, db_user: User, p
                 sender_username=db_user.username,
                 pseudonym=db_user.pseudonym,
                 lang=db_user.lang,
-                text=draft.text,
+                text=text,
                 recipient_id=draft.recipient_id,
                 recipient_username=draft.recipient_username,
                 group_id=draft.group_id,
@@ -76,6 +85,10 @@ async def persist_drafts(session: AsyncSession, cipher: Cipher, db_user: User, p
                 is_group=draft.is_group or bool(pending),
                 media_type=draft.media_type,
                 media_file_id=draft.media_file_id,
+                media_key=draft.media_key,
+                label=draft.label,
+                is_sealed=draft.is_sealed,
+                seal_key_enc=seal_key_enc,
                 ttl_seconds=draft.ttl_seconds,
                 ttl_explicit=True,
                 delivery_mode="inline",
@@ -112,6 +125,23 @@ async def on_inline(
     limited = False
     if db_user.started_at is not None:
         limited = await is_rate_limited(session, cipher.hmac_sender(db_user.id), utcnow())
+    id_users: dict[int, User | None] = {}
+    for uid in parsed.user_ids:
+        user = await repo.get_user(session, int(uid))
+        id_users[int(uid)] = user if user is not None and user.started_at is not None else None
+    media_key_status = None
+    if parsed.media_key:
+        media_key_status = await convert.check_key(session, parsed.media_key, db_user.id, utcnow())
+    contact_info = [
+        {
+            "username": item.username,
+            "user_id": item.contact_user_id,
+            "first_name": item.first_name,
+            "last_name": item.last_name,
+            "favorite": item.favorite,
+        }
+        for item in contacts
+    ]
     plan = build_inline_plan(
         parsed,
         lang=db_user.lang,
@@ -128,8 +158,14 @@ async def on_inline(
         media_type=media.media_type if media else None,
         media_file_id=media.file_id if media else None,
         group_match=group_match,
+        id_users=id_users,
+        media_key_status=media_key_status,
+        contact_info=contact_info,
     )
-    if db_user.started_at is not None and not limited and not parsed.ttl_error:
+    if db_user.started_at is not None and not limited and not parsed.ttl_error and media_key_status not in {
+        "missing",
+        "not_yours",
+    }:
         await persist_drafts(session, cipher, db_user, plan)
     button = None
     if plan.button_text and plan.button_start:
@@ -166,5 +202,18 @@ async def on_chosen(
         except Exception:
             pass
         return
+    whisper = result.whisper
+    if whisper is not None and whisper.seal_key_enc:
+        seal_key = cipher.decrypt_secret(whisper.seal_key_enc)
+        whisper.seal_key_enc = None
+        if seal_key:
+            try:
+                await bot.send_message(
+                    chosen.from_user.id,
+                    t(db_user.lang, "sealed_key_message", code=seal_key),
+                    protect_content=True,
+                )
+            except Exception:
+                pass
     if result.new_member_ids and result.group_name:
         await notify_added(bot, session, result.new_member_ids, result.group_name)

@@ -13,14 +13,17 @@ from bot.db import repo
 from bot.db.models import User
 from bot.handlers.common import is_private
 from bot.keyboards.builders import markup
+from bot.services import convert as convert_service
 from bot.services.crypto import Cipher
 from bot.services.deeplink import ttl_link
 from bot.services.delivery import DeliveryReport, deliver_outgoing, sender_result_text
 from bot.services.i18n import format_ttl, media_kind, t
 from bot.services.media_info import extract_media, media_too_big
+from bot.services.parser import parse_media_key, parse_sealed
 from bot.services.recipients import resolve_recipient
+from bot.services.seal import new_seal_key, seal_encrypt
 from bot.services.ttl import DurationError, parse_duration, parse_schedule, validate_ttl
-from bot.services.views import ButtonSpec, clip_button, send_mode_keyboard, send_ttl_keyboard
+from bot.services.views import ButtonSpec, clip_button, label_keyboard, send_mode_keyboard, send_ttl_keyboard
 from bot.services.whisper_service import NewWhisper, create_whisper, is_rate_limited, remember_contact
 from bot.states import SendFlow
 from bot.utils.text import clean_secret, clip, preview
@@ -46,12 +49,19 @@ async def begin_send(message: Message, state: FSMContext, session: AsyncSession,
     groups = await repo.list_user_groups(session, db_user.id)
     rows: list[list[ButtonSpec]] = []
     for contact in contacts:
+        from bot.services.views import contact_star, display_user
+
+        label = contact_star(contact.favorite) + display_user(
+            contact.username,
+            contact.contact_user_id,
+            db_user.lang,
+            contact.first_name,
+            contact.last_name,
+        )
         if contact.username:
-            rows.append([ButtonSpec(f"@{contact.username}", callback_data=f"sendto:u:{contact.username}")])
+            rows.append([ButtonSpec(label, callback_data=f"sendto:u:{contact.username}")])
         elif contact.contact_user_id:
-            rows.append(
-                [ButtonSpec(t(db_user.lang, "id_label", id=contact.contact_user_id), callback_data=f"sendto:id:{contact.contact_user_id}")]
-            )
+            rows.append([ButtonSpec(label, callback_data=f"sendto:id:{contact.contact_user_id}")])
     for group, count in groups[:6]:
         rows.append(
             [
@@ -118,16 +128,27 @@ async def ask_confirm(message: Message, state: FSMContext, db_user: User, send_a
         when=when,
         preview=preview(body, 300) or t(lang, "empty_secret"),
     )
-    await message.answer(
-        text,
-        protect_content=True,
-        reply_markup=markup(
-            [
-                [ButtonSpec(t(lang, "send_confirm_btn"), callback_data="send:ok")],
-                [ButtonSpec(t(lang, "send_cancel_btn"), callback_data="send:no")],
-            ]
-        ),
-    )
+    rows: list[list[ButtonSpec]] = [[ButtonSpec(t(lang, "send_confirm_btn"), callback_data="send:ok")]]
+    rows.extend(label_keyboard("send:label"))
+    rows.append([ButtonSpec(t(lang, "send_cancel_btn"), callback_data="send:no")])
+    await message.answer(text, protect_content=True, reply_markup=markup(rows))
+
+
+async def _process_content_text(raw: str, state: FSMContext, session, db_user: User, cipher: Cipher) -> str | None:
+    """Cut MEDIA_ID out of the whisper text, validate the key, detect e2e.
+
+    Returns an error message or None on success."""
+    media_key = parse_media_key(raw)
+    if media_key:
+        status = await convert_service.check_key(session, media_key, db_user.id, utcnow())
+        if status == "missing":
+            return t(db_user.lang, "convert_missing")
+        if status == "not_yours":
+            return t(db_user.lang, "convert_not_yours")
+        await state.update_data(media_key=media_key)
+    if parse_sealed(raw):
+        await state.update_data(sealed=True)
+    return None
 
 
 @router.message(Command("send"))
@@ -222,26 +243,37 @@ async def skip_text(callback: CallbackQuery, state: FSMContext, db_user: User) -
 
 
 @router.message(SendFlow.content, F.text, ~F.text.startswith("/"))
-async def content_text(message: Message, state: FSMContext, db_user: User) -> None:
+async def content_text(message: Message, state: FSMContext, db_user: User, session=None, cipher=None) -> None:
     data = await state.get_data()
     raw = message.text or ""
     if raw.strip() in {"-", "—"} and data.get("media_file_id"):
         await state.update_data(text=None)
         await ask_mode(message, state, db_user)
         return
-    text = clean_secret(raw)
-    if text is None:
-        await message.answer(t(db_user.lang, "send_need_content"))
-        return
-    if len(text) > MAX_TEXT_LEN:
+    if session is not None and cipher is not None:
+        error = await _process_content_text(raw, state, session, db_user, cipher)
+        if error:
+            await message.answer(error)
+            return
+    from bot.constants import E2E_RE, MEDIA_ID_RE
+
+    cleaned = E2E_RE.sub(" ", MEDIA_ID_RE.sub(" ", raw))
+    text = clean_secret(cleaned)
+    if text is not None:
+        text = " ".join(text.split()) or None
+    if text is not None and len(text) > MAX_TEXT_LEN:
         await message.answer(t(db_user.lang, "text_too_long"))
+        return
+    data = await state.get_data()
+    if text is None and not data.get("media_file_id") and not data.get("media_key"):
+        await message.answer(t(db_user.lang, "send_need_content"))
         return
     await state.update_data(text=text)
     await ask_mode(message, state, db_user)
 
 
 @router.message(SendFlow.content, F.photo | F.video | F.document | F.animation | F.voice | F.audio | F.video_note)
-async def content_media(message: Message, state: FSMContext, db_user: User) -> None:
+async def content_media(message: Message, state: FSMContext, db_user: User, session=None, cipher=None) -> None:
     extracted = extract_media(message)
     if extracted is None:
         await message.answer(t(db_user.lang, "send_need_content"))
@@ -250,7 +282,18 @@ async def content_media(message: Message, state: FSMContext, db_user: User) -> N
     if media_too_big(size):
         await message.answer(t(db_user.lang, "media_too_big"))
         return
-    caption = clean_secret(message.caption)
+    caption = message.caption or ""
+    if session is not None and cipher is not None and caption:
+        error = await _process_content_text(caption, state, session, db_user, cipher)
+        if error:
+            await message.answer(error)
+            return
+    from bot.constants import E2E_RE, MEDIA_ID_RE
+
+    cleaned = E2E_RE.sub(" ", MEDIA_ID_RE.sub(" ", caption))
+    caption = clean_secret(cleaned)
+    if caption is not None:
+        caption = " ".join(caption.split()) or None
     if caption and len(caption) > MAX_TEXT_LEN:
         await message.answer(t(db_user.lang, "text_too_long"))
         return
@@ -262,6 +305,22 @@ async def content_media(message: Message, state: FSMContext, db_user: User) -> N
         t(db_user.lang, "send_ask_content"),
         reply_markup=markup([[ButtonSpec(t(db_user.lang, "send_skip_text"), callback_data="send:notext")]]),
     )
+
+
+@router.callback_query(F.data.startswith("send:label:"))
+async def pick_label(callback: CallbackQuery, state: FSMContext, db_user: User) -> None:
+    from bot.constants import ENVELOPE_LABELS
+
+    label = callback.data.split(":")[-1]
+    if label not in ENVELOPE_LABELS:
+        await callback.answer()
+        return
+    await state.update_data(label=label)
+    await callback.answer()
+    if callback.message is not None:
+        send_at_str = (await state.get_data()).get("send_at")
+        send_at = datetime.strptime(send_at_str, "%Y-%m-%dT%H:%M:%S") if send_at_str else utcnow()
+        await ask_confirm(callback.message, state, db_user, send_at)
 
 
 @router.callback_query(F.data.startswith("send:mode:"))
@@ -348,7 +407,7 @@ async def send_ok(
 ) -> None:
     data = await state.get_data()
     lang = db_user.lang
-    if not data.get("text") and not data.get("media_file_id"):
+    if not data.get("text") and not data.get("media_file_id") and not data.get("media_key"):
         await callback.answer(t(lang, "send_need_content"), show_alert=True)
         return
     if await is_rate_limited(session, cipher.hmac_sender(db_user.id), utcnow()):
@@ -365,6 +424,14 @@ async def send_ok(
         ttl_seconds = TTL_PRESETS[code] if code in TTL_PRESETS else data.get("ttl_seconds")
     else:
         ttl_seconds = db_user.default_ttl
+    text = data.get("text")
+    sealed = bool(data.get("sealed") or db_user.seal_default)
+    seal_key = None
+    seal_key_enc = None
+    if sealed and text:
+        seal_key = new_seal_key()
+        text = seal_encrypt(text, seal_key)
+        seal_key_enc = cipher.encrypt_secret(seal_key)
     whisper = await create_whisper(
         session,
         cipher,
@@ -373,7 +440,7 @@ async def send_ok(
             sender_username=None if anonymous else db_user.username,
             pseudonym=None if anonymous else db_user.pseudonym,
             lang=lang,
-            text=data.get("text"),
+            text=text,
             recipient_id=None if is_group else data.get("recipient_id"),
             recipient_username=None if is_group else data.get("recipient_username"),
             group_id=data.get("group_id") if is_group else None,
@@ -381,6 +448,10 @@ async def send_ok(
             is_group=is_group,
             media_type=data.get("media_type"),
             media_file_id=data.get("media_file_id"),
+            media_key=data.get("media_key"),
+            label=data.get("label"),
+            is_sealed=bool(sealed and text),
+            seal_key_enc=seal_key_enc,
             ttl_seconds=ttl_seconds,
             ttl_explicit=True,
             default_ttl=db_user.default_ttl,
@@ -391,6 +462,16 @@ async def send_ok(
             now=now,
         ),
     )
+    if seal_key:
+        whisper.seal_key_enc = None
+        try:
+            await bot.send_message(
+                db_user.id,
+                t(lang, "sealed_key_message", code=seal_key),
+                protect_content=True,
+            )
+        except Exception:
+            pass
     if not is_group:
         await remember_contact(session, db_user.id, data.get("recipient_username"), data.get("recipient_id"), now)
     if data.get("media_file_id"):

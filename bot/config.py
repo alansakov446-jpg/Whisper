@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     backup_interval_minutes: int = 30
     log_level: str = "INFO"
     fernet_key_path: str = Field(default="data/fernet.key")
+    web_base_url: str = ""
 
 
 def get_settings() -> Settings:

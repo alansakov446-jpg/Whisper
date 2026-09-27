@@ -235,6 +235,54 @@ async def on_group(
     if action == "hist" and group is not None:
         await _show_history(callback, session, db_user, group)
         return
+    if action == "export" and group is not None:
+        await _export_group_json(callback, session, db_user, group)
+        return
+    if action == "autojoin" and group is not None:
+        await _toggle_autojoin(callback, session, db_user, group, bot_username)
+        return
+    await callback.answer()
+
+
+async def _export_group_json(callback, session: AsyncSession, db_user: User, group) -> None:
+    import json
+
+    from aiogram.types import BufferedInputFile
+
+    from bot.services.export_stats import export_group
+
+    lang = db_user.lang
+    if group.creator_id != db_user.id:
+        await callback.answer(t(lang, "group_not_creator"), show_alert=True)
+        return
+    payload = await export_group(session, group, utcnow())
+    raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    await callback.message.answer_document(
+        BufferedInputFile(raw, filename=f"group_{group.id}.json"),
+        caption=t(lang, "group_export_caption", name=group.name),
+    )
+    await callback.answer()
+
+
+async def _toggle_autojoin(callback, session: AsyncSession, db_user: User, group, bot_username: str) -> None:
+    import secrets
+
+    from bot.constants import TOKEN_BYTES
+    from bot.services.deeplink import group_invite_link
+
+    lang = db_user.lang
+    if group.creator_id != db_user.id:
+        await callback.answer(t(lang, "group_not_creator"), show_alert=True)
+        return
+    if group.auto_join and group.invite_token:
+        group.auto_join = False
+        group.invite_token = None
+        await callback.message.answer(t(lang, "group_autojoin_off"))
+    else:
+        group.invite_token = secrets.token_urlsafe(TOKEN_BYTES)
+        group.auto_join = True
+        link = group_invite_link(bot_username, group.invite_token)
+        await callback.message.answer(t(lang, "group_autojoin_on", link=link))
     await callback.answer()
 
 

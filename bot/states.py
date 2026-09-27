@@ -13,6 +13,7 @@ class SendFlow(StatesGroup):
 class SettingsFlow(StatesGroup):
     custom_ttl = State()
     pseudonym = State()
+    quiet = State()
 
 
 class GroupFlow(StatesGroup):
@@ -22,3 +23,15 @@ class GroupFlow(StatesGroup):
 
 class TtlFlow(StatesGroup):
     custom = State()
+
+
+class SealFlow(StatesGroup):
+    key = State()
+
+
+class ReplyFlow(StatesGroup):
+    text = State()
+
+
+class ConvertFlow(StatesGroup):
+    waiting = State()

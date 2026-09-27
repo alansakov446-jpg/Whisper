@@ -19,11 +19,16 @@ class User(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
     username: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    first_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
     lang: Mapped[str] = mapped_column(String(8), nullable=False, default="ru")
     pseudonym: Mapped[str | None] = mapped_column(String(64), nullable=True)
     default_ttl: Mapped[int | None] = mapped_column(Integer, nullable=True)
     default_mode: Mapped[str] = mapped_column(String(16), nullable=False, default="open")
     notifications: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    seal_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    quiet_from: Mapped[str | None] = mapped_column(String(5), nullable=True)
+    quiet_to: Mapped[str | None] = mapped_column(String(5), nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
 
@@ -51,6 +56,11 @@ class Whisper(Base):
     text: Mapped[str | None] = mapped_column(Text, nullable=True)
     media_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
     media_file_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    media_key: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    label: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    is_sealed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    seal_key_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reply_to_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     ttl_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     ttl_explicit: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -82,6 +92,8 @@ class Group(Base):
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     creator_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
     successor_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    invite_token: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True)
+    auto_join: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
 
 
@@ -121,6 +133,9 @@ class Contact(Base):
     owner_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     contact_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     username: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    first_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    favorite: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     last_used_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
 
 
@@ -131,4 +146,27 @@ class PendingMedia(Base):
     media_type: Mapped[str] = mapped_column(String(32), nullable=False)
     file_id: Mapped[str] = mapped_column(Text, nullable=False)
     file_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class MediaKey(Base):
+    __tablename__ = "media_keys"
+    __table_args__ = (UniqueConstraint("key", name="uq_media_keys_key"),)
+
+    id: Mapped[int] = mapped_column(_pk(), primary_key=True, autoincrement=True)
+    key: Mapped[str] = mapped_column(String(16), nullable=False)
+    owner_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    media_group: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    files: Mapped[str] = mapped_column(Text, nullable=False)
+    multi_use: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    use_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class Pin(Base):
+    __tablename__ = "pins"
+
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    whisper_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)

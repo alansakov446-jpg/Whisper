@@ -60,11 +60,16 @@ async def make_user(session, user_id: int, username: str | None = None, **kwargs
     user = User(
         id=user_id,
         username=username,
+        first_name=kwargs.pop("first_name", None),
+        last_name=kwargs.pop("last_name", None),
         lang=kwargs.pop("lang", "ru"),
         pseudonym=kwargs.pop("pseudonym", None),
         default_ttl=kwargs.pop("default_ttl", None),
         default_mode=kwargs.pop("default_mode", "open"),
         notifications=kwargs.pop("notifications", True),
+        seal_default=kwargs.pop("seal_default", False),
+        quiet_from=kwargs.pop("quiet_from", None),
+        quiet_to=kwargs.pop("quiet_to", None),
         started_at=kwargs.pop("started_at", now),
         created_at=now,
     )
